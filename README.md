@@ -97,6 +97,8 @@ Mouse wheel scrolls the settings page — dropdowns do not change value when you
 
 ## TTS chain
 
+Default engine: **ElevenLabs** (set in Settings → Default TTS).
+
 1. **ElevenLabs** (API key + network; some regions need a VPN)
 2. **Edge TTS**
 3. **gTTS**
@@ -104,8 +106,14 @@ Mouse wheel scrolls the settings page — dropdowns do not change value when you
 ## Audio cache
 
 ```text
-~/.config/voicebox/cache/phrases/
+~/.config/voicebox/cache/phrases/<id>.mp3
 ```
+
+- **One file per phrase** — re-Save overwrites that file only (no old versions kept).
+- **Test / hotkey / command**: play the locked `.mp3` if present; if missing, synthesize once and save.
+- **✓ SAVE PHRASE**: re-record **that** phrase with the **current** mood/model/engine.
+- Changing global mood in Settings does **not** wipe other phrases — bake mood per phrase via Save.
+- **Clear phrase cache** deletes all `.mp3` files manually.
 
 ## Local data (never committed)
 

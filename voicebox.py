@@ -279,7 +279,7 @@ def normalize_eleven_key(raw: str) -> str:
 
 def default_config() -> dict:
     return {
-        "provider": "auto",
+        "provider": "eleven",
         "eleven_keys": [],
         "eleven_key_index": 0,
         "eleven_voice": EL_DEFAULT_VOICE,
@@ -292,7 +292,7 @@ def default_config() -> dict:
         # words = speak word right after space/punct
         "speak_mode": "line",
         "theme": "dark",  # dark | light | neon
-        "default_tts": "auto",  # auto | eleven | edge | gtts for free typing
+        "default_tts": "eleven",  # eleven | auto | edge | gtts for free typing
     }
 
 
@@ -696,7 +696,16 @@ def phrase_cache_paths(phrase_id: str) -> tuple[Path, Path]:
     return CACHE_DIR / f"{phrase_id}.mp3", CACHE_DIR / f"{phrase_id}.meta.json"
 
 
+def phrase_has_cache(phrase_id: str) -> bool:
+    mp3, _ = phrase_cache_paths(phrase_id)
+    try:
+        return mp3.is_file() and mp3.stat().st_size > 100
+    except OSError:
+        return False
+
+
 def invalidate_phrase_cache(phrase_id: str) -> None:
+    """Delete the single audio file for this phrase (no version history)."""
     mp3, meta = phrase_cache_paths(phrase_id)
     for p in (mp3, meta):
         try:
@@ -715,12 +724,30 @@ def _load_cache_meta(phrase_id: str) -> dict | None:
         return None
 
 
-def _save_cache(phrase_id: str, key: str, provider: str, src_mp3: Path) -> None:
+def _save_cache(
+    phrase_id: str,
+    provider: str,
+    src_mp3: Path,
+    *,
+    text: str = "",
+    mood: str = "",
+    model: str = "",
+) -> None:
+    """Overwrite phrase audio in place (one mp3 per phrase id — no old copies kept)."""
     mp3, meta = phrase_cache_paths(phrase_id)
     try:
         shutil.copyfile(src_mp3, mp3)
         meta.write_text(
-            json.dumps({"key": key, "provider": provider}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "provider": provider,
+                    "text": (text or "")[:200],
+                    "mood": mood or "",
+                    "model": model or "",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
     except OSError:
@@ -838,10 +865,17 @@ def speak_sync(
     *,
     provider_override: str | None = None,
     phrase_id: str | None = None,
+    force_rebuild: bool = False,
 ) -> str:
     """
     Synchronous TTS for one chunk. Call only from the TTS worker thread.
     Returns backend name: eleven|edge|gtts|cache.
+
+    Phrase audio files (one .mp3 per phrase id):
+      - If a file exists and force_rebuild is False → play it (ignore current mood).
+      - If missing, or force_rebuild (Save phrase) → synth with current settings,
+        overwrite that phrase's file, then play.
+    Free typing (no phrase_id) never uses the phrase cache.
     """
     text = text.strip()
     if not text:
@@ -858,35 +892,31 @@ def speak_sync(
     vol = int(cfg.get("volume", 100))
 
     # effective provider
-    prov = (provider_override or cfg.get("default_tts") or "auto").lower()
+    prov = (provider_override or cfg.get("default_tts") or "eleven").lower()
     if prov not in ("auto", "eleven", "edge", "gtts"):
-        prov = "auto"
-    # for auto fingerprint use 'auto' chain result later
+        prov = "eleven"
 
-    # phrase cache
-    if phrase_id:
-        # fingerprint uses resolved provider for non-auto; for auto we store actual backend after synth
-        # try any existing cache with matching key for each possible backend
-        candidates = ["eleven", "edge", "gtts"] if prov == "auto" else [prov]
-        for cand in candidates:
-            key = phrase_cache_key(text, cfg, cand)
-            meta = _load_cache_meta(phrase_id)
-            mp3, _ = phrase_cache_paths(phrase_id)
-            if meta and meta.get("key") == key and mp3.is_file() and mp3.stat().st_size > 100:
-                status(f"cache ({cand})…")
-                _play_mp3_file(mp3, vol, sink)
-                return "cache"
+    # Locked phrase audio: play existing file without re-synth
+    if phrase_id and not force_rebuild and phrase_has_cache(phrase_id):
+        mp3, _ = phrase_cache_paths(phrase_id)
+        status("cache…")
+        _play_mp3_file(mp3, vol, sink)
+        return "cache"
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
         out_path = Path(tmp.name)
     try:
         used = _synth_to_mp3(text, cfg, prov, out_path, on_status=status)
         if phrase_id:
-            key = phrase_cache_key(text, cfg, used if prov == "auto" else prov)
-            # store under actual backend key when auto
-            store_prov = used if prov == "auto" else prov
-            key = phrase_cache_key(text, cfg, store_prov)
-            _save_cache(phrase_id, key, store_prov, out_path)
+            _save_cache(
+                phrase_id,
+                used,
+                out_path,
+                text=text,
+                mood=str(cfg.get("mood") or ""),
+                model=str(cfg.get("model") or ""),
+            )
+            status(f"saved audio ({used})")
         _play_mp3_file(out_path, vol, sink)
         return used
     finally:
@@ -934,6 +964,7 @@ class TTSQueue:
         *,
         provider: str | None = None,
         phrase_id: str | None = None,
+        force_rebuild: bool = False,
     ) -> int:
         """Append a phrase. Return queue length including the current item."""
         text = text.strip()
@@ -943,7 +974,7 @@ class TTSQueue:
         with self._lock:
             self._pending += 1
             n = self._pending
-        self._q.put((text, cfg_copy, provider, phrase_id))
+        self._q.put((text, cfg_copy, provider, phrase_id, force_rebuild))
         if self._playing or n > 1:
             self._ui(f"queued: {n} · «{text[:40]}{'…' if len(text) > 40 else ''}»", "queue")
         return n
@@ -953,11 +984,14 @@ class TTSQueue:
             item = self._q.get()
             if item is None:
                 break
+            force_rebuild = False
             if len(item) == 2:
                 text, cfg = item
                 provider = phrase_id = None
-            else:
+            elif len(item) == 4:
                 text, cfg, provider, phrase_id = item
+            else:
+                text, cfg, provider, phrase_id, force_rebuild = item
             with self._lock:
                 self._playing = True
                 left = self._pending
@@ -969,6 +1003,7 @@ class TTSQueue:
                     on_status=lambda m: self._ui(m, "info"),
                     provider_override=provider,
                     phrase_id=phrase_id,
+                    force_rebuild=bool(force_rebuild),
                 )
                 tail = f" ({used})" if used and used != "eleven" else ""
                 with self._lock:
@@ -1320,12 +1355,20 @@ def hotkey_display(hotkey: str) -> str:
     return "+".join(parts)
 
 
-def pynput_key_to_token(key) -> str | None:
+def pynput_key_to_token(key, *, x_keycode: int | None = None) -> str | None:
     """Map pynput key object to our hotkey token (physical top-row digits, not !@#)."""
     try:
         from pynput.keyboard import KeyCode
     except ImportError:
         return None
+
+    # X11 hardware keycode (PC: 10=1 … 18=9, 19=0) — stable under Ctrl+Shift+layout.
+    # pynput often reports wrong keysym (e.g. Ctrl+Shift+4 → ';') without this.
+    kc = x_keycode
+    if kc is None:
+        kc = getattr(key, "_x_keycode", None)
+    if isinstance(kc, int) and 10 <= kc <= 19:
+        return "1234567890"[kc - 10]
 
     if isinstance(key, KeyCode):
         # Prefer shifted-digit char (!@#) → digit, before generic printable
@@ -1532,25 +1575,30 @@ class HotkeyService:
     def _start_listener_unlocked(self) -> tuple[bool, str]:
         from pynput import keyboard
 
+        # Thread-local last X11 keycode from patched pynput (Linux only)
+        last_x_keycode: dict[str, int | None] = {"v": None}
+
         def on_press(key) -> None:
-            tok = _canonical_key_token(pynput_key_to_token(key))
+            tok = _canonical_key_token(
+                pynput_key_to_token(key, x_keycode=last_x_keycode.get("v"))
+            )
+            last_x_keycode["v"] = None
             if not tok:
                 return
             self._pressed.add(tok)
             self._check_fire()
 
         def on_release(key) -> None:
-            tok = _canonical_key_token(pynput_key_to_token(key))
+            tok = _canonical_key_token(
+                pynput_key_to_token(key, x_keycode=last_x_keycode.get("v"))
+            )
+            last_x_keycode["v"] = None
             if tok and tok in self._pressed:
                 self._pressed.discard(tok)
             else:
                 # Press may have been '!'→1 while release arrives as bare '1' (or reverse).
-                # Drop any single digit still held if a digit-ish key was released.
                 if tok and tok.isdigit():
                     self._pressed.discard(tok)
-                elif tok is None:
-                    # unknown release — try clearing shifted-digit ghosts
-                    pass
             # clear fired for bindings no longer fully held
             held = set(self._pressed)
             self._fired = {
@@ -1559,6 +1607,24 @@ class HotkeyService:
             }
 
         try:
+            # Attach X11 hardware keycode to each event (Ctrl+Shift+4 otherwise becomes ';')
+            try:
+                from pynput.keyboard import _xorg as _pynput_xorg  # type: ignore
+
+                _orig_event_to_key = _pynput_xorg.Listener._event_to_key
+
+                def _event_to_key_with_code(self, display, event):  # type: ignore[no-untyped-def]
+                    key = _orig_event_to_key(self, display, event)
+                    try:
+                        last_x_keycode["v"] = int(event.detail)
+                    except Exception:
+                        last_x_keycode["v"] = None
+                    return key
+
+                _pynput_xorg.Listener._event_to_key = _event_to_key_with_code  # type: ignore[method-assign]
+            except Exception:
+                pass
+
             listener = keyboard.Listener(on_press=on_press, on_release=on_release)
             listener.start()
             self._listener = listener
@@ -2030,7 +2096,13 @@ class VoiceboxApp:
 
         section("Phrase audio cache")
         tk.Label(
-            body, text=str(CACHE_DIR), fg=MUTED, bg=BG, font=("Segoe UI", 8),
+            body,
+            text=(
+                f"{CACHE_DIR}\n"
+                "One .mp3 per phrase. Changing mood/settings does NOT re-record.\n"
+                "Re-Save a phrase to bake current mood into that phrase only."
+            ),
+            fg=MUTED, bg=BG, font=("Segoe UI", 8), justify="left",
         ).pack(anchor="w", padx=16)
         row = tk.Frame(body, bg=BG)
         row.pack(fill="x", padx=16, pady=6)
@@ -2154,9 +2226,12 @@ class VoiceboxApp:
         self.cfg["default_tts"] = dtts
         if self.cfg.get("eleven_keys") and dtts in ("auto", "eleven"):
             self.cfg["provider"] = "eleven"
+        elif dtts in ("edge", "gtts"):
+            self.cfg["provider"] = dtts
 
         apply_theme(theme)
-        clear_phrase_cache()
+        # Do NOT wipe phrase audio on settings save — each phrase keeps its own .mp3
+        # until that phrase is re-saved or cache is cleared manually.
         save_config(self.cfg)
         self._recolor_shell()
         self._set_status(f"✓ settings saved · mode={mode} · theme={theme}", OK)
@@ -2402,12 +2477,13 @@ class VoiceboxApp:
                 pct = int(round(phrase_pick_chance(p, cpool) * 100))
                 pool_bits.append(f"cmd pool×{len(cpool)} · next ~{pct}%")
         pool_line = ("\n🎲 " + "  ·  ".join(pool_bits)) if pool_bits else ""
+        audio = "audio ✓" if phrase_has_cache(p["id"]) else "audio — (Test or Save to record)"
         self.ph_info.configure(
             text=(
                 f"Name: {p.get('name') or '—'}   ·   "
                 f"Hotkey: {hotkey_display(p.get('hotkey') or '')}   ·   "
                 f"Cmd: {p.get('command') or '—'}   ·   "
-                f"TTS: {p.get('tts_provider') or 'auto'}"
+                f"TTS: {p.get('tts_provider') or 'eleven'}   ·   {audio}"
                 f"{pool_line}\n"
                 f"Text: {text or '(empty)'}"
             ),
@@ -2489,18 +2565,19 @@ class VoiceboxApp:
                 p["name"] = name
                 p["command"] = command
                 write_phrase_text(p, text)
-                invalidate_phrase_cache(p["id"])
             else:
                 pid = uuid.uuid4().hex[:12]
                 p = {
                     "id": pid, "name": name, "hotkey": "", "command": command,
-                    "tts_provider": "auto", "file": f"{pid}.txt", "weight": 1.0,
+                    "tts_provider": "eleven", "file": f"{pid}.txt", "weight": 1.0,
                 }
                 write_phrase_text(p, text)
                 self.phrases.append(p)
 
             save_phrases(self.phrases)
             self.phrases = load_phrases()
+            # Re-find after reload (new dict objects)
+            p = next((x for x in self.phrases if x["id"] == p["id"]), p)
             self._reload_hotkeys()
             self._phrases_refresh()
             try:
@@ -2510,7 +2587,16 @@ class VoiceboxApp:
                 pass
             self._ph_hide_editor()
             self._ph_update_info()
-            self._set_status(f"✓ phrase saved: {name}", OK)
+            # Rebuild THIS phrase's audio only, with current mood/model/engine
+            text_now = read_phrase_text(p).strip()
+            prov = p.get("tts_provider") or "eleven"
+            _TTS.submit(
+                text_now, self.cfg, provider=prov, phrase_id=p["id"], force_rebuild=True,
+            )
+            self._set_status(
+                f"✓ phrase saved: {name} · recording audio ({prov}, mood={self.cfg.get('mood')})",
+                OK,
+            )
         except Exception as e:
             messagebox.showerror("Error", str(e), parent=self.root)
             self._set_status(f"save failed: {e}", ERR)
@@ -2599,11 +2685,14 @@ class VoiceboxApp:
 
         def save() -> None:
             p["tts_provider"] = var.get()
-            invalidate_phrase_cache(p["id"])
+            # Engine change does not wipe audio; re-Save phrase to re-record.
             save_phrases(self.phrases)
             self._phrases_refresh()
             win.destroy()
-            self._set_status(f"TTS for «{p.get('name')}» = {var.get()}", OK)
+            self._set_status(
+                f"TTS for «{p.get('name')}» = {var.get()} · re-Save phrase to re-record audio",
+                OK,
+            )
 
         foot = tk.Frame(win, bg=BG2)
         foot.pack(fill="x", side="bottom")
@@ -2625,9 +2714,14 @@ class VoiceboxApp:
         if not text:
             messagebox.showerror("Error", "Empty phrase", parent=self.root)
             return
-        prov = p.get("tts_provider") or "auto"
-        _TTS.submit(text, self.cfg, provider=prov, phrase_id=p["id"])
-        self._set_status(f"queued ({prov}): {text[:40]}", ACCENT2)
+        prov = p.get("tts_provider") or "eleven"
+        has = phrase_has_cache(p["id"])
+        # Play locked file if present; only synth+save when no file yet
+        _TTS.submit(text, self.cfg, provider=prov, phrase_id=p["id"], force_rebuild=False)
+        if has:
+            self._set_status(f"test cache: {text[:40]}", ACCENT2)
+        else:
+            self._set_status(f"test synth+save ({prov}): {text[:40]}", ACCENT2)
 
     def _ph_delete(self) -> None:
         p = self._ph_selected()
