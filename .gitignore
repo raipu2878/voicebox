@@ -7,11 +7,15 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-# Secrets & local config (keys live under ~/.config/voicebox/)
+# Secrets & local config (keys / phrases live under ~/.config/voicebox/ only)
 .env
 .env.*
 *.pem
+config.json
 config.local.json
+phrases/
+cache/
+history
 
 # OS / editor
 .DS_Store
