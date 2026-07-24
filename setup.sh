@@ -11,5 +11,5 @@ mkdir -p "$HOME/.local/bin"
 ln -sfn "$ROOT/vo" "$HOME/.local/bin/vo"
 chmod +x "$ROOT/vo" "$ROOT/setup.sh"
 
-echo "Готово:  vo  — окно always-on-top"
+echo "Done:  vo  — always-on-top window"
 echo "  /settings  /exit"

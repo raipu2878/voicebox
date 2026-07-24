@@ -1,73 +1,73 @@
 # voicebox
 
-Always-on-top окно: пишешь текст → облачная озвучка.  
-Поверх игр и мессенджеров (Dota / CS / Discord / Telegram).
+Always-on-top window: type text → cloud TTS.  
+Stays above games and messengers (Dota / CS / Discord / Telegram).
 
-Озвучка идёт **по очереди**: новая фраза не прерывает текущую.
+Speech is **queued**: a new phrase never interrupts the current one.
 
-## Быстрый старт
+## Quick start
 
 ```bash
 git clone https://github.com/raipu2878/voicebox.git
 cd voicebox
 ./setup.sh
-# плеер:
+# audio player:
 sudo apt install mpv
 vo
 ```
 
-## В окне
+## In the window
 
 | | |
 |--|--|
-| текст + **Enter** | озвучить (режим «строка») |
-| `/settings` или **⚙ Настройки** | настройки |
-| **✓ Сохранить настройки** | записать и применить |
-| `/exit` | закрыть |
+| text + **Enter** | speak (line mode) |
+| `/settings` or **⚙ Settings** | open settings |
+| **✓ Save settings** | apply and persist |
+| `/exit` | quit |
 
-## Режимы озвучки
+## Speak modes
 
-| Режим | Поведение |
+| Mode | Behavior |
 |--|--|
-| **Строка + Enter** (дефолт) | Enter → озвучить → поле очищается |
-| **По словам** | после пробела слово озвучивается сразу |
+| **Line + Enter** (default) | Enter → speak → clear the field |
+| **Word by word** | after space, the word is spoken immediately |
 
-## TTS (цепочка)
+## TTS chain
 
-1. **ElevenLabs** — если есть API-ключ и доступ (из РФ часто нужен VPN)  
-2. **Edge TTS** — бесплатный fallback  
-3. **gTTS** — запасной канал  
+1. **ElevenLabs** — if you have an API key and network access (some regions need VPN)  
+2. **Edge TTS** — free fallback  
+3. **gTTS** — last-resort fallback  
 
-Ключи **не хранятся в репозитории**. Они лежат локально:
+API keys are **not stored in this repo**. They live only on your machine:
 
 ```text
 ~/.config/voicebox/config.json
 ```
 
-Или вставляются в **Настройки → + ключ** / переменная `ELEVENLABS_API_KEY`.
+Or paste them via **Settings → + key** / env var `ELEVENLABS_API_KEY`.
 
-## Виртуальный микрофон
+## Virtual microphone
 
-При запуске создаётся **Voicebox_Mic** (PipeWire/PulseAudio).  
-Выбери его как input в Discord / TG / Dota, если нужно «говорить» озвучкой.
+On launch, **Voicebox_Mic** is created (PipeWire/PulseAudio).  
+Select it as the input in Discord / TG / Dota if you want apps to hear the TTS.
 
-- `both` — кабель + наушники  
-- `virt` — только кабель  
-- `speakers` — только колонки  
+- `both` — virtual cable + headphones  
+- `virt` — cable only  
+- `speakers` — speakers only  
 
-## Требования
+## Requirements
 
 - Linux + Python 3.10+  
-- `mpv` или `paplay`  
-- интернет для TTS  
+- `mpv` or `paplay`  
+- internet for TTS  
 
-## Команды установки
+## Install commands
 
 ```bash
-./setup.sh          # venv + зависимости + symlink ~/.local/bin/vo
-vo                  # запуск
+./setup.sh          # venv + deps + symlink ~/.local/bin/vo
+vo                  # run
 ```
 
-## Лицензия
+## License
 
-MIT — делай что хочешь.
+MIT — do whatever you want.

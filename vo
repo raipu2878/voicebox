@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Короткая команда: открыть меню voicebox
+# Short launcher: open the voicebox window
 set -euo pipefail
-# если vo — симлинк, берём реальный путь к скрипту
+# if vo is a symlink, resolve to the real script path
 SOURCE="${BASH_SOURCE[0]}"
 while [[ -L "$SOURCE" ]]; do
   DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"

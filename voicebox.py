@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-voicebox — always-on-top окно: пишешь → озвучка.
+voicebox — always-on-top window: type text → speak it.
 
-  vo            открыть окно
-  /settings     настройки (в окне)
-  /exit         закрыть
+  vo            open window
+  /settings     settings (in the window)
+  /exit         quit
 
-Режимы озвучки:
-  line   — Enter → озвучить строку и очистить
-  words  — слово сразу после пробела
+Speak modes:
+  line   — Enter → speak the line and clear the field
+  words  — speak each word right after a space
 
-Очередь: новый текст не прерывает текущий, ждёт своей очереди.
+Queue: new text never interrupts the current phrase; it waits its turn.
 """
 
 from __future__ import annotations
@@ -33,10 +33,10 @@ from tkinter import messagebox, simpledialog, ttk
 try:
     import edge_tts
 except ImportError:
-    print("edge-tts не установлен. ./setup.sh", file=sys.stderr)
+    print("edge-tts is not installed. Run ./setup.sh", file=sys.stderr)
     sys.exit(1)
 
-# ── константы ──────────────────────────────────────────────────────────────
+# ── constants ──────────────────────────────────────────────────────────────
 CONFIG_DIR = Path.home() / ".config" / "voicebox"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
@@ -57,7 +57,7 @@ VIRT_SOURCE = "voicebox_mic"
 VIRT_SINK_DESC = "Voicebox"
 VIRT_SOURCE_DESC = "Voicebox_Mic"
 
-# тёмная тема
+# dark theme
 BG = "#1a1b22"
 BG2 = "#24262f"
 FG = "#e4e6ed"
@@ -106,8 +106,8 @@ def default_config() -> dict:
         "volume": 100,
         "audio_out": "both",  # virt | both | speakers
         "use_virt_mic": True,
-        # line  = Enter → озвучить строку и очистить
-        # words = слово озвучивается сразу (пробел / знак)
+        # line  = Enter → speak line and clear
+        # words = speak word right after space/punct
         "speak_mode": "line",
     }
 
@@ -147,7 +147,7 @@ def load_config() -> dict:
         cfg["model"] = EL_MODEL_V3
     if (cfg.get("audio_out") or "") not in ("virt", "both", "speakers"):
         cfg["audio_out"] = "both"
-    # миграция старых режимов
+    # migrate legacy modes
     mode = cfg.get("speak_mode") or "line"
     if mode in ("delay", "debounce"):
         mode = "line"
@@ -221,7 +221,7 @@ def _pactl(*args: str) -> subprocess.CompletedProcess[str]:
 
 def ensure_virtual_cable(hear_locally: bool = True) -> tuple[bool, str]:
     if not shutil.which("pactl"):
-        return False, "нет pactl"
+        return False, "pactl not found"
     sinks = _pactl("list", "short", "sinks").stdout or ""
     sources = _pactl("list", "short", "sources").stdout or ""
 
@@ -257,7 +257,7 @@ def ensure_virtual_cable(hear_locally: bool = True) -> tuple[bool, str]:
     sinks2 = _pactl("list", "short", "sinks").stdout or ""
     sources2 = _pactl("list", "short", "sources").stdout or ""
     ok = VIRT_SINK in sinks2 and VIRT_SOURCE in sources2
-    return (True, f"mic={VIRT_SOURCE_DESC}") if ok else (False, "не поднялся")
+    return (True, f"mic={VIRT_SOURCE_DESC}") if ok else (False, "failed to create")
 
 
 # ── TTS ────────────────────────────────────────────────────────────────────
@@ -333,7 +333,7 @@ def _eleven_stream_play(
         if pulse_sink:
             cmd.insert(-1, f"--audio-device=pulse/{pulse_sink}")
     else:
-        raise RuntimeError("нужен paplay или mpv")
+        raise RuntimeError("paplay or mpv required")
 
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
@@ -366,7 +366,7 @@ def _eleven_stream_play(
 
 def _play_mp3_file(path: Path, volume: int, pulse_sink: str | None) -> None:
     if not shutil.which("mpv"):
-        raise RuntimeError("нужен mpv")
+        raise RuntimeError("mpv required")
     cmd = [
         "mpv", "--no-video", "--really-quiet", "--force-window=no",
         f"--volume={max(0, min(150, volume))}", str(path),
@@ -406,13 +406,13 @@ def _eleven_file_play(
 
 
 def _speak_edge_file(text: str, volume: int, pulse_sink: str | None) -> None:
-    """Microsoft Edge neural (обычно доступен из РФ)."""
+    """Microsoft Edge neural TTS (works in many regions without a key)."""
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
         path = Path(tmp.name)
     try:
         asyncio.run(synth_edge(text, path))
         if path.stat().st_size < 100:
-            raise RuntimeError("Edge TTS: пустой ответ")
+            raise RuntimeError("Edge TTS: empty audio")
         _play_mp3_file(path, volume, pulse_sink)
     finally:
         try:
@@ -422,17 +422,17 @@ def _speak_edge_file(text: str, volume: int, pulse_sink: str | None) -> None:
 
 
 def _speak_gtts_file(text: str, volume: int, pulse_sink: str | None) -> None:
-    """Google Translate TTS — запасной канал."""
+    """Google Translate TTS — last-resort fallback."""
     try:
         from gtts import gTTS
     except ImportError as e:
-        raise RuntimeError("gTTS не установлен: pip install gTTS") from e
+        raise RuntimeError("gTTS is not installed: pip install gTTS") from e
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
         path = Path(tmp.name)
     try:
         gTTS(text=text, lang="ru").save(str(path))
         if path.stat().st_size < 100:
-            raise RuntimeError("gTTS: пустой ответ")
+            raise RuntimeError("gTTS: empty audio")
         _play_mp3_file(path, volume, pulse_sink)
     finally:
         try:
@@ -460,8 +460,8 @@ def _is_geo_block(err: BaseException) -> bool:
 
 def speak_sync(text: str, cfg: dict, on_status=None) -> str:
     """
-    Синхронная озвучка (один кусок). Вызывать только из TTS-воркера.
-    Возвращает имя бэкенда: eleven|edge|gtts.
+    Synchronous TTS for one chunk. Call only from the TTS worker thread.
+    Returns backend name: eleven|edge|gtts.
     """
     text = text.strip()
     if not text:
@@ -523,20 +523,20 @@ def speak_sync(text: str, cfg: dict, on_status=None) -> str:
 
     hint = ""
     if any("403" in x or "Forbidden" in x for x in errors):
-        hint = " · ElevenLabs в РФ часто режет без VPN"
+        hint = " · ElevenLabs is often blocked by region (try VPN)"
     raise RuntimeError("; ".join(errors) + hint)
 
 
 class TTSQueue:
     """
-    Единая очередь озвучки: строго по одному, без прерываний.
-    Новый текст всегда встаёт в хвост.
+    Single TTS queue: one phrase at a time, no interruptions.
+    New text is always appended to the end.
     """
 
     def __init__(self) -> None:
         self._q: queue.Queue = queue.Queue()
         self._lock = threading.Lock()
-        self._pending = 0  # ждёт + сейчас играет
+        self._pending = 0  # waiting + currently playing
         self._playing = False
         self._on_ui = None  # callable(msg, color?)
         self._thread = threading.Thread(target=self._loop, daemon=True, name="voicebox-tts-queue")
@@ -558,7 +558,7 @@ class TTSQueue:
             return self._pending
 
     def submit(self, text: str, cfg: dict) -> int:
-        """Добавить фразу в конец очереди. Вернуть число позиций в очереди (включая текущую)."""
+        """Append a phrase. Return queue length including the current item."""
         text = text.strip()
         if not text:
             return self.qsize()
@@ -569,7 +569,7 @@ class TTSQueue:
         self._q.put((text, cfg_copy))
         waiting = max(0, n - (1 if self._playing else 0))
         if self._playing or n > 1:
-            self._ui(f"в очереди: {n} · «{text[:40]}{'…' if len(text) > 40 else ''}»", "queue")
+            self._ui(f"queued: {n} · «{text[:40]}{'…' if len(text) > 40 else ''}»", "queue")
         return n
 
     def _loop(self) -> None:
@@ -582,18 +582,18 @@ class TTSQueue:
                 self._playing = True
                 left = self._pending
             preview = text[:48] + ("…" if len(text) > 48 else "")
-            self._ui(f"озвучка: {preview}" + (f"  ·  ещё в очереди: {left - 1}" if left > 1 else ""), "info")
+            self._ui(f"speaking: {preview}" + (f"  ·  still queued: {left - 1}" if left > 1 else ""), "info")
             try:
                 used = speak_sync(text, cfg, on_status=lambda m: self._ui(m, "info"))
                 tail = f" ({used})" if used and used != "eleven" else ""
                 with self._lock:
                     rest = max(0, self._pending - 1)
                 if rest:
-                    self._ui(f"готово{tail} · дальше по очереди ({rest})", "ok")
+                    self._ui(f"done{tail} · next in queue ({rest})", "ok")
                 else:
-                    self._ui(f"готово{tail}", "ok")
+                    self._ui(f"done{tail}", "ok")
             except Exception as e:
-                self._ui(f"ошибка: {e}", "err")
+                self._ui(f"error: {e}", "err")
             finally:
                 with self._lock:
                     self._pending = max(0, self._pending - 1)
@@ -601,7 +601,7 @@ class TTSQueue:
                     self._q.task_done()
 
 
-# один глобальный воркер на процесс
+# one global worker per process
 _TTS = TTSQueue()
 
 
@@ -616,18 +616,18 @@ class VoiceboxApp:
         self.root.geometry("520x280+80+80")
         self.root.minsize(360, 200)
 
-        # поверх всех окон (Dota / CS / Discord / TG)
+        # always on top (Dota / CS / Discord / TG)
         self.root.attributes("-topmost", True)
         try:
             self.root.wm_attributes("-topmost", True)
         except tk.TclError:
             pass
 
-        # индекс уже озвученного (только words)
+        # index of already spoken text (words mode only)
         self._spoken_upto = 0
 
         self._build_ui()
-        # очередь TTS: никогда не прерывает текущую фразу
+        # TTS queue: never interrupts the current phrase
         _TTS.set_ui_callback(self._tts_ui)
         threading.Thread(target=self._setup_virt, daemon=True).start()
         self._update_status()
@@ -647,7 +647,7 @@ class VoiceboxApp:
         ).pack(side="left")
 
         tk.Button(
-            head, text="⚙ Настройки", command=self._open_settings,
+            head, text="⚙ Settings", command=self._open_settings,
             bg=BG2, fg=FG, relief="flat", padx=10, pady=3,
             activebackground=ACCENT, activeforeground="#111",
             font=("Segoe UI", 9),
@@ -658,7 +658,7 @@ class VoiceboxApp:
 
         hint = tk.Label(
             self.root,
-            text="/settings  ·  /exit  ·  всегда сверху",
+            text="/settings  ·  /exit  ·  always on top",
             fg=MUTED, bg=BG, font=("Segoe UI", 9),
         )
         hint.pack(anchor="w", padx=12)
@@ -700,7 +700,7 @@ class VoiceboxApp:
             pass
 
     def _topmost_pulse(self) -> None:
-        """Периодически закреплять поверх игр/оверлеев."""
+        """Keep the window above games/overlays."""
         self._keep_top()
         try:
             self.root.after(2000, self._topmost_pulse)
@@ -717,9 +717,9 @@ class VoiceboxApp:
 
         def ui() -> None:
             if ok:
-                self._set_status(f"вирт.mic: {VIRT_SOURCE_DESC}  ·  {msg}", OK)
+                self._set_status(f"virt mic: {VIRT_SOURCE_DESC}  ·  {msg}", OK)
             else:
-                self._set_status(f"вирт.кабель: {msg}", ERR)
+                self._set_status(f"virt cable: {msg}", ERR)
 
         try:
             self.root.after(0, ui)
@@ -729,9 +729,9 @@ class VoiceboxApp:
     def _update_status(self) -> None:
         mode = self.cfg.get("speak_mode") or "line"
         if mode == "words":
-            self.lbl_mode.config(text="режим: по словам")
+            self.lbl_mode.config(text="mode: word by word")
         else:
-            self.lbl_mode.config(text="режим: Enter = строка")
+            self.lbl_mode.config(text="mode: Enter = line")
 
     def _set_status(self, msg: str, color: str = MUTED) -> None:
         try:
@@ -753,8 +753,8 @@ class VoiceboxApp:
 
     def _on_return(self, event: tk.Event):
         """
-        line  → озвучить всё поле, очистить, без перевода строки
-        words → озвучить хвост слова, очищать не обязательно
+        line  → speak full field, clear it, no newline
+        words → speak trailing word (field not necessarily cleared)
         """
         content = self.text.get("1.0", "end-1c")
         stripped = content.strip()
@@ -778,7 +778,7 @@ class VoiceboxApp:
                 self._enqueue_speak(stripped)
             return "break"
 
-        # words: добить последнее слово без пробела
+        # words: flush last word without trailing space
         pending = content[self._spoken_upto :].strip()
         if pending:
             self._spoken_upto = len(content)
@@ -803,7 +803,7 @@ class VoiceboxApp:
         if stripped.startswith("/"):
             return
 
-        # только режим words реагирует на каждый символ
+        # only words mode reacts on every keystroke
         if (self.cfg.get("speak_mode") or "line") == "words":
             self._handle_words(content)
 
@@ -824,14 +824,14 @@ class VoiceboxApp:
             self._enqueue_speak(speakable)
 
     def _enqueue_speak(self, text: str) -> None:
-        """В хвост очереди — текущую озвучку не трогаем."""
+        """Append to queue — never interrupt current playback."""
         text = text.strip()
         if not text:
             return
         n = _TTS.submit(text, self.cfg)
         if n > 1:
             self._set_status(
-                f"в очереди: {n} · «{text[:40]}{'…' if len(text) > 40 else ''}»",
+                f"queued: {n} · «{text[:40]}{'…' if len(text) > 40 else ''}»",
                 ACCENT,
             )
 
@@ -839,14 +839,14 @@ class VoiceboxApp:
         SettingsDialog(self.root, self.cfg, on_save=self._on_settings_saved)
 
     def _on_settings_saved(self, cfg: dict) -> None:
-        # полная копия, чтобы speak_mode/volume точно применились
+        # deep copy so speak_mode/volume apply reliably
         self.cfg = json.loads(json.dumps(cfg))
         save_config(self.cfg)
         self._spoken_upto = 0
         self._update_status()
         threading.Thread(target=self._setup_virt, daemon=True).start()
         mode = self.cfg.get("speak_mode")
-        self._set_status(f"✓ настройки сохранены · режим={mode}", OK)
+        self._set_status(f"✓ settings saved · mode={mode}", OK)
         self.text.focus_set()
 
     def _exit(self) -> None:
@@ -872,13 +872,13 @@ class SettingsDialog(tk.Toplevel):
         self.grab_set()
 
         tk.Label(
-            self, text="Настройки", fg=ACCENT, bg=BG, font=("Segoe UI", 13, "bold"),
+            self, text="Settings", fg=ACCENT, bg=BG, font=("Segoe UI", 13, "bold"),
         ).pack(anchor="w", padx=14, pady=(12, 4))
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=14, pady=6)
 
-        self._section(body, "Режим озвучки (выбери один)")
+        self._section(body, "Speak mode (pick one)")
         cur = self.cfg.get("speak_mode") or "line"
         if cur not in ("line", "words"):
             cur = "line"
@@ -886,32 +886,32 @@ class SettingsDialog(tk.Toplevel):
         f = tk.Frame(body, bg=BG)
         f.pack(fill="x", pady=2)
         tk.Radiobutton(
-            f, text="Строка + Enter  →  озвучить и очистить поле",
+            f, text="Line + Enter  →  speak and clear the field",
             variable=self.var_mode, value="line",
             bg=BG, fg=FG, selectcolor=BG2, activebackground=BG, activeforeground=FG,
             font=("Segoe UI", 10),
         ).pack(anchor="w")
         tk.Radiobutton(
-            f, text="По словам  →  слово озвучивается сразу (после пробела)",
+            f, text="Word by word  →  speak each word right after space",
             variable=self.var_mode, value="words",
             bg=BG, fg=FG, selectcolor=BG2, activebackground=BG, activeforeground=FG,
             font=("Segoe UI", 10),
         ).pack(anchor="w")
 
-        self._section(body, "Громкость 0–150")
+        self._section(body, "Volume 0–150")
         self.var_vol = tk.StringVar(value=str(int(self.cfg.get("volume", 100))))
         tk.Entry(
             body, textvariable=self.var_vol, bg=ENTRY_BG, fg=FG, insertbackground=ACCENT,
             relief="flat", font=("Segoe UI", 11),
         ).pack(fill="x", ipady=6, pady=2)
 
-        self._section(body, "Настроение (mood)")
+        self._section(body, "Mood")
         self.var_mood = tk.StringVar(value=self.cfg.get("mood") or "soft")
         ttk.Combobox(
             body, textvariable=self.var_mood, values=list(MOODS.keys()), state="readonly",
         ).pack(fill="x", pady=2)
 
-        self._section(body, "Модель TTS")
+        self._section(body, "TTS model")
         self.var_model = tk.StringVar(value=self.cfg.get("model") or EL_MODEL_V3)
         ttk.Combobox(
             body, textvariable=self.var_model,
@@ -919,45 +919,45 @@ class SettingsDialog(tk.Toplevel):
             state="readonly",
         ).pack(fill="x", pady=2)
 
-        self._section(body, "Аудио выход")
+        self._section(body, "Audio output")
         self.var_audio = tk.StringVar(value=self.cfg.get("audio_out") or "both")
         ttk.Combobox(
             body, textvariable=self.var_audio,
             values=["both", "virt", "speakers"], state="readonly",
         ).pack(fill="x", pady=2)
         tk.Label(
-            body, text="both = кабель+наушники · virt = только Voicebox_Mic · speakers",
+            body, text="both = cable+headphones · virt = Voicebox_Mic only · speakers",
             fg=MUTED, bg=BG, font=("Segoe UI", 8),
         ).pack(anchor="w")
 
-        self._section(body, "API-ключи ElevenLabs")
+        self._section(body, "ElevenLabs API keys")
         keys = self.cfg.get("eleven_keys") or []
         self.lbl_keys = tk.Label(
-            body, text=f"ключей: {len(keys)}  (~{len(keys) * EL_FREE_CREDITS_MONTH:,} кред/мес)",
+            body, text=f"keys: {len(keys)}  (~{len(keys) * EL_FREE_CREDITS_MONTH:,} credits/mo)",
             fg=ACCENT2, bg=BG, font=("Segoe UI", 10),
         )
         self.lbl_keys.pack(anchor="w")
         bf = tk.Frame(body, bg=BG)
         bf.pack(fill="x", pady=4)
         tk.Button(
-            bf, text="+ ключ", command=self._add_key,
+            bf, text="+ key", command=self._add_key,
             bg=BG2, fg=FG, relief="flat", padx=10, pady=4, activebackground=ACCENT,
         ).pack(side="left", padx=(0, 6))
         tk.Button(
-            bf, text="− последний", command=self._del_key,
+            bf, text="− last", command=self._del_key,
             bg=BG2, fg=FG, relief="flat", padx=10, pady=4, activebackground=ERR,
         ).pack(side="left")
 
-        # большая кнопка сохранить
+        # primary save button
         bot = tk.Frame(self, bg=BG)
         bot.pack(fill="x", padx=14, pady=14)
         tk.Button(
-            bot, text="✓  Сохранить настройки", command=self._save,
+            bot, text="✓  Save settings", command=self._save,
             bg=ACCENT, fg="#111", relief="flat", padx=18, pady=10,
             font=("Segoe UI", 11, "bold"), activebackground=OK,
         ).pack(fill="x", pady=(0, 8))
         tk.Button(
-            bot, text="Отмена", command=self.destroy,
+            bot, text="Cancel", command=self.destroy,
             bg=BG2, fg=FG, relief="flat", padx=12, pady=6,
         ).pack(fill="x")
 
@@ -967,23 +967,23 @@ class SettingsDialog(tk.Toplevel):
         ).pack(anchor="w", pady=(10, 2))
 
     def _add_key(self) -> None:
-        raw = simpledialog.askstring("API key", "Вставь sk_…", parent=self)
+        raw = simpledialog.askstring("API key", "Paste sk_…", parent=self)
         if not raw:
             return
         key = normalize_eleven_key(raw)
         if not key.startswith("sk_") or len(key) < 20:
-            messagebox.showerror("Ошибка", "Ключ выглядит странно", parent=self)
+            messagebox.showerror("Error", "Key looks invalid", parent=self)
             return
         keys = list(self.cfg.get("eleven_keys") or [])
         if key in keys:
-            messagebox.showinfo("Ок", "Уже есть", parent=self)
+            messagebox.showinfo("OK", "Already added", parent=self)
             return
         keys.append(key)
         self.cfg["eleven_keys"] = keys
         self.cfg["eleven_key_index"] = len(keys) - 1
         self.cfg["provider"] = "eleven"
         self.lbl_keys.config(
-            text=f"ключей: {len(keys)}  (~{len(keys) * EL_FREE_CREDITS_MONTH:,} кред/мес)"
+            text=f"keys: {len(keys)}  (~{len(keys) * EL_FREE_CREDITS_MONTH:,} credits/mo)"
         )
 
     def _del_key(self) -> None:
@@ -994,7 +994,7 @@ class SettingsDialog(tk.Toplevel):
         self.cfg["eleven_keys"] = keys
         self.cfg["eleven_key_index"] = max(0, len(keys) - 1)
         self.lbl_keys.config(
-            text=f"ключей: {len(keys)}  (~{len(keys) * EL_FREE_CREDITS_MONTH:,} кред/мес)"
+            text=f"keys: {len(keys)}  (~{len(keys) * EL_FREE_CREDITS_MONTH:,} credits/mo)"
         )
 
     def _save(self) -> None:
@@ -1004,7 +1004,7 @@ class SettingsDialog(tk.Toplevel):
         try:
             vol = max(0, min(150, int(self.var_vol.get().strip())))
         except ValueError:
-            messagebox.showerror("Ошибка", "Громкость — число 0–150", parent=self)
+            messagebox.showerror("Error", "Volume must be a number 0–150", parent=self)
             return
 
         self.cfg["speak_mode"] = mode
@@ -1017,10 +1017,10 @@ class SettingsDialog(tk.Toplevel):
             self.cfg["provider"] = "eleven"
 
         save_config(self.cfg)
-        # подтверждение на экране
+        # confirmation dialog
         messagebox.showinfo(
-            "Сохранено",
-            f"Настройки применены.\nРежим: {'по словам' if mode == 'words' else 'строка + Enter'}",
+            "Saved",
+            f"Settings applied.\nMode: {'word by word' if mode == 'words' else 'line + Enter'}",
             parent=self,
         )
         self.on_save(self.cfg)
@@ -1029,7 +1029,7 @@ class SettingsDialog(tk.Toplevel):
 
 def main() -> int:
     if not shutil.which("mpv") and not shutil.which("paplay"):
-        print("Нужен mpv или paplay: sudo apt install mpv", file=sys.stderr)
+        print("mpv or paplay required: sudo apt install mpv", file=sys.stderr)
         return 1
     app = VoiceboxApp()
     app.run()
