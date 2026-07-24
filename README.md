@@ -1,6 +1,6 @@
 # voicebox
 
-Always-on-top Linux TTS window: type text → speak it.  
+Always-on-top Linux TTS app: type text → speak it.  
 Stays above games and messengers (Dota / CS / Discord / Telegram).
 
 Speech is **queued** — new phrases never interrupt the current one.
@@ -15,23 +15,43 @@ sudo apt install mpv
 vo
 ```
 
-`./setup.sh` creates a venv, installs dependencies, and links `vo` into `~/.local/bin`.
+`./setup.sh` creates a venv, installs dependencies, links `vo` into `~/.local/bin`, and installs a **desktop entry** so you can open voicebox from the Super/launcher menu.
 
-## One window, three pages
+### Run as a real app (not tied to the terminal)
 
-| Tab | Purpose |
+```bash
+vo
+```
+
+The shell returns immediately; closing that terminal does **not** kill voicebox.
+
+Debug (keep attached to the terminal):
+
+```bash
+VOICEBOX_FOREGROUND=1 vo
+```
+
+### Open from Super / app menu
+
+After `./setup.sh`, press **Super**, type **voicebox**, Enter.
+
+## Main menu
+
+| Button | Action |
 |--|--|
-| **Speak** | Type text, press Enter to speak, slash commands |
+| **Speak** | Open the type box (Enter = line, or word+space mode) |
 | **Phrases** | Presets, global hotkeys, `/commands`, per-phrase TTS |
 | **Settings** | Mode, volume, mood, theme, default TTS, API keys |
+| **Exit** | Quit |
 
-Native window controls (minimize / maximize / close) come from your desktop.
+Subpages have **← Menu** (or press Esc on Speak).
 
 ### Speak page
 
 | Input | Action |
 |--|--|
 | text + **Enter** | Speak (line mode) or flush word (words mode) |
+| `/menu` | Back to main menu |
 | `/settings` | Open Settings |
 | `/phrases` | Open Phrases |
 | `/exit` | Quit |
@@ -47,25 +67,33 @@ Native window controls (minimize / maximize / close) come from your desktop.
 
 | Trigger | Notes |
 |--|--|
-| Global hotkey | X11 via pynput; prefer borderless / windowed games (exclusive fullscreen may grab keys) |
+| Global hotkey | X11 via pynput; prefer borderless / windowed games |
 | Slash command | Type `/cmd` + Enter on the Speak page |
 
-Hotkeys support top-row digits and numpad. **Shift+digit** (e.g. `!` for `1`) is normalized to the physical digit, so **Ctrl+Shift+1** works as expected.
+Hotkeys support top-row digits and numpad. **Shift+digit** (e.g. `!` for `1`) is normalized to the physical digit.
 
-Reserved commands: `/exit`, `/settings`, `/phrases`.
+### Shared hotkeys / commands (weighted random)
+
+You can assign the **same hotkey** and/or **same slash command** to several phrases. On each trigger, one phrase is picked with a **weighted pseudo-random** rule (anti-streak / pity):
+
+1. Start equal (two phrases → 50/50).
+2. The winner keeps **half** of its weight; the other half is split among the losers.
+3. Example: A wins → A 25% / B 75%. A wins again → A 12.5% / B 87.5%.
+
+Weights live in `~/.config/voicebox/phrases/index.json`. The Phrases panel shows `pool×N · next ~X%` when shared.
+
+Reserved commands: `/exit`, `/settings`, `/phrases`, `/menu`.
 
 ### Settings page
 
 - Speak mode: **line** or **words**
 - Volume, mood, TTS model, audio output (`both` / `virt` / `speakers`)
 - UI theme: `dark` (default), `light`, `neon`
-- Default TTS for free typing on the Speak page
+- Default TTS for free typing
 - Phrase audio cache clear
 - ElevenLabs API keys (stored only on your machine)
 
-Mouse wheel scrolls the settings page itself — dropdowns (Mood, TTS model, …) do not change value when you scroll.
-
-**✓ SAVE SETTINGS** is always at the bottom.
+Mouse wheel scrolls the settings page — dropdowns do not change value when you scroll.
 
 ## TTS chain
 
@@ -73,38 +101,31 @@ Mouse wheel scrolls the settings page itself — dropdowns (Mood, TTS model, …
 2. **Edge TTS**
 3. **gTTS**
 
-Phrases can override the engine per entry. Default for free typing is set in Settings.
-
 ## Audio cache
-
-Cached phrase audio lives under:
 
 ```text
 ~/.config/voicebox/cache/phrases/
 ```
 
-Re-synthesized only when phrase text / engine / voice settings change.
-
 ## Local data (never committed)
 
-All personal data stays under your home directory — not in this repo:
-
 ```text
-~/.config/voicebox/config.json          # settings + API keys
-~/.config/voicebox/phrases/index.json    # phrase metadata
-~/.config/voicebox/phrases/<id>.txt      # phrase text
-~/.config/voicebox/cache/phrases/        # cached audio
+~/.config/voicebox/config.json
+~/.config/voicebox/phrases/
+~/.config/voicebox/cache/phrases/
 ```
-
-Do **not** commit API keys, `config.json`, or phrase files. Add keys only through the Settings UI (or edit `~/.config/voicebox/config.json` locally).
 
 ## Requirements
 
 - Linux + Python 3.10+
 - X11 (global hotkeys use pynput)
-- `mpv` or `paplay` for playback
+- `mpv` or `paplay`
 - Internet for cloud TTS
-- Optional: PipeWire virtual mic for routing into games/Discord
+- Optional: PipeWire virtual mic
+
+## Games note
+
+Exclusive fullscreen titles may minimize when another window takes focus — that is the game/OS, not voicebox. Prefer **Borderless Window** in the game video settings. Global hotkeys still work when the game has focus (unless the game grabs the keyboard exclusively).
 
 ## License
 

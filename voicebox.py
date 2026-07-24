@@ -11,6 +11,8 @@ Speak modes:
   words  — speak each word right after a space
 
 Preset phrases with global hotkeys (e.g. Ctrl+… in games).
+Shared hotkeys/commands pick a phrase with weighted pseudo-random
+(winner loses half its weight to the others — anti-streak pity).
 Queue: new text never interrupts the current phrase; it waits its turn.
 """
 
@@ -21,6 +23,7 @@ import hashlib
 import json
 import os
 import queue
+import random
 import shutil
 import subprocess
 import sys
@@ -1013,14 +1016,24 @@ def normalize_slash_command(raw: str) -> str:
 RESERVED_COMMANDS = {
     "/exit", "/quit", "/settings", "/set",
     "/phrases", "/phrase", "/ph",
+    "/menu", "/home",
 }
+
+
+def _phrase_weight(p: dict) -> float:
+    try:
+        w = float(p.get("weight", 1.0))
+    except (TypeError, ValueError):
+        w = 1.0
+    return w if w > 1e-12 else 1e-12
 
 
 def load_phrases() -> list[dict]:
     """
     Load phrase index. Each item:
-      {id, name, hotkey, command, file}
+      {id, name, hotkey, command, tts_provider, file, weight}
     Text body lives in phrases/<id>.txt
+    weight is used for shared hotkey/command pseudo-random picks.
     """
     _ensure_phrases_dir()
     if not PHRASES_INDEX.is_file():
@@ -1043,13 +1056,17 @@ def load_phrases() -> list[dict]:
                 "command": normalize_slash_command(str(item.get("command") or "")),
                 "tts_provider": prov,
                 "file": str(item.get("file") or f"{item['id']}.txt"),
+                "weight": _phrase_weight(item),
             })
         return out
     except (json.JSONDecodeError, OSError):
         return []
 
 
-def save_phrases(phrases: list[dict]) -> None:
+_PHRASES_IO_LOCK = threading.RLock()
+
+
+def _save_phrases_unlocked(phrases: list[dict]) -> None:
     _ensure_phrases_dir()
     clean = []
     for p in phrases:
@@ -1063,6 +1080,7 @@ def save_phrases(phrases: list[dict]) -> None:
             "command": normalize_slash_command(p.get("command") or ""),
             "tts_provider": prov,
             "file": p.get("file") or f"{p['id']}.txt",
+            "weight": round(_phrase_weight(p), 6),
         })
     PHRASES_INDEX.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
@@ -1071,16 +1089,96 @@ def save_phrases(phrases: list[dict]) -> None:
         pass
 
 
-def find_phrase_by_command(cmd: str, phrases: list[dict] | None = None) -> dict | None:
-    """Match slash command to a phrase (case-insensitive)."""
+def save_phrases(phrases: list[dict]) -> None:
+    with _PHRASES_IO_LOCK:
+        _save_phrases_unlocked(phrases)
+
+
+def find_phrases_by_command(cmd: str, phrases: list[dict] | None = None) -> list[dict]:
+    """All phrases bound to this slash command (case-insensitive)."""
     n = normalize_slash_command(cmd)
     if not n or n in RESERVED_COMMANDS:
-        return None
+        return []
     phrases = phrases if phrases is not None else load_phrases()
+    return [
+        p for p in phrases
+        if normalize_slash_command(p.get("command") or "") == n
+    ]
+
+
+def find_phrase_by_command(cmd: str, phrases: list[dict] | None = None) -> dict | None:
+    """First phrase with this command (no weight mutation). Prefer pick for playback."""
+    found = find_phrases_by_command(cmd, phrases)
+    return found[0] if found else None
+
+
+def find_phrases_by_hotkey(hotkey: str, phrases: list[dict] | None = None) -> list[dict]:
+    """All phrases bound to the same normalized hotkey."""
+    hk = normalize_hotkey_tokens((hotkey or "").split("+"))
+    if not hk:
+        return []
+    phrases = phrases if phrases is not None else load_phrases()
+    out = []
     for p in phrases:
-        if normalize_slash_command(p.get("command") or "") == n:
-            return p
-    return None
+        ph = normalize_hotkey_tokens((p.get("hotkey") or "").split("+"))
+        if ph == hk:
+            out.append(p)
+    return out
+
+
+def phrase_pick_chance(phrase: dict, pool: list[dict]) -> float:
+    """Probability (0..1) that phrase would be chosen from pool right now."""
+    if not pool:
+        return 0.0
+    if len(pool) == 1:
+        return 1.0
+    total = sum(_phrase_weight(p) for p in pool)
+    if total <= 0:
+        return 1.0 / len(pool)
+    return _phrase_weight(phrase) / total
+
+
+def pick_weighted_phrase(
+    candidates: list[dict],
+    all_phrases: list[dict] | None = None,
+    *,
+    persist: bool = True,
+) -> dict:
+    """
+    Weighted pseudo-random pick among candidates that share a hotkey/command.
+
+    After a pick, the winner keeps half of its weight; the other half is split
+    equally among the losers (pity / anti-streak). Example with two phrases
+    starting at weight 1 (50/50): A wins → A=0.5, B=1.5 → 25%/75%; A wins
+    again → A=0.25, B=1.75 → 12.5%/87.5%.
+
+    Weights are stored on each phrase and persist in the index file.
+    """
+    if not candidates:
+        raise ValueError("no candidates")
+    if len(candidates) == 1:
+        return candidates[0]
+
+    with _PHRASES_IO_LOCK:
+        weights = [_phrase_weight(p) for p in candidates]
+        chosen = random.choices(candidates, weights=weights, k=1)[0]
+        w = _phrase_weight(chosen)
+        half = w / 2.0
+        chosen["weight"] = half
+        others = [p for p in candidates if p["id"] != chosen["id"]]
+        share = half / len(others)
+        for p in others:
+            p["weight"] = _phrase_weight(p) + share
+        # keep group sum stable (~N) so floats stay well-scaled
+        total = sum(_phrase_weight(p) for p in candidates)
+        target = float(len(candidates))
+        if total > 0:
+            scale = target / total
+            for p in candidates:
+                p["weight"] = _phrase_weight(p) * scale
+        if persist:
+            _save_phrases_unlocked(all_phrases if all_phrases is not None else candidates)
+    return chosen
 
 
 def phrase_text_path(phrase: dict) -> Path:
@@ -1384,7 +1482,8 @@ class HotkeyService:
     def __init__(self) -> None:
         self._listener = None
         self._lock = threading.Lock()
-        self._bindings: dict[str, str] = {}  # normalized hotkey -> phrase_id
+        # normalized hotkey -> list of phrase ids (shared keys = weighted pool)
+        self._bindings: dict[str, list[str]] = {}
         self._phrases: list[dict] = []
         self._cfg_provider = lambda: {}
         self._on_fire = None
@@ -1405,13 +1504,12 @@ class HotkeyService:
 
         phrases = phrases if phrases is not None else load_phrases()
         self._phrases = phrases
-        bindings: dict[str, str] = {}
+        bindings: dict[str, list[str]] = {}
         for p in phrases:
             hk = normalize_hotkey_tokens((p.get("hotkey") or "").split("+"))
             if not hk:
                 continue
-            if hk not in bindings:
-                bindings[hk] = p["id"]
+            bindings.setdefault(hk, []).append(p["id"])
 
         with self._lock:
             self._bindings = bindings
@@ -1473,28 +1571,35 @@ class HotkeyService:
         held.discard(None)  # type: ignore[arg-type]
         with self._lock:
             items = list(self._bindings.items())
-        for hk, pid in items:
+        for hk, pids in items:
             keys = set(hk.split("+")) if hk else set()
             if not keys or hk in self._fired:
                 continue
             # exact match, or binding ⊆ held with only extra modifiers allowed
             if keys == held:
                 self._fired.add(hk)
-                self._activate(pid)
+                self._activate(pids)
             elif keys.issubset(held):
                 extra = held - keys
                 mods = {"ctrl", "shift", "alt", "super"}
                 if not (extra - mods):
                     self._fired.add(hk)
-                    self._activate(pid)
+                    self._activate(pids)
 
-    def _activate(self, phrase_id: str) -> None:
-        phrase = next((p for p in self._phrases if p["id"] == phrase_id), None)
-        if not phrase:
+    def _activate(self, phrase_ids: list[str] | str) -> None:
+        if isinstance(phrase_ids, str):
+            phrase_ids = [phrase_ids]
+        id_set = set(phrase_ids)
+        candidates = [p for p in self._phrases if p["id"] in id_set]
+        if not candidates:
             self._phrases = load_phrases()
-            phrase = next((p for p in self._phrases if p["id"] == phrase_id), None)
-        if not phrase:
+            candidates = [p for p in self._phrases if p["id"] in id_set]
+        # skip empty bodies
+        candidates = [p for p in candidates if read_phrase_text(p).strip()]
+        if not candidates:
             return
+        pool_n = len(candidates)
+        phrase = pick_weighted_phrase(candidates, self._phrases, persist=True)
         text = read_phrase_text(phrase).strip()
         if not text:
             return
@@ -1504,7 +1609,13 @@ class HotkeyService:
         _TTS.submit(text, cfg, provider=prov, phrase_id=phrase.get("id"))
         if self._on_fire:
             try:
-                self._on_fire(name, text)
+                chance = phrase_pick_chance(phrase, candidates)
+                self._on_fire(name, text, pool_n, chance)
+            except TypeError:
+                try:
+                    self._on_fire(name, text)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -1516,32 +1627,30 @@ class HotkeyService:
 _HOTKEYS = HotkeyService()
 
 
-
 # ── single-window UI ───────────────────────────────────────────────────────
 
 class VoiceboxApp:
-    """One native window; pages: speak / settings / phrases."""
+    """One native window; home menu + speak / phrases / settings pages."""
 
     def __init__(self) -> None:
         self.cfg = load_config()
         apply_theme(self.cfg.get("theme") or "dark")
 
-        self.root = tk.Tk()
+        # className → WM_CLASS for desktop launchers (Super → "voicebox")
+        self.root = tk.Tk(className="voicebox")
         self.root.title("voicebox")
-        self.root.geometry("640x520+80+80")
-        self.root.minsize(520, 420)
+        self.root.geometry("420x480+80+80")
+        self.root.minsize(360, 400)
         self.root.resizable(True, True)
         self.root.configure(bg=BG)
-        # native decorations (min/max/close from the window manager)
-        self.root.attributes("-topmost", True)
         try:
-            self.root.wm_attributes("-topmost", True)
+            self.root.attributes("-topmost", True)
         except tk.TclError:
             pass
 
         self._spoken_upto = 0
         self.phrases = load_phrases()
-        self._page = "speak"
+        self._page = "menu"
         self._edit_phrase_id: str | None = None
         self._hotkey_target: str | None = None
         self._hotkey_mods: set[str] = set()
@@ -1553,6 +1662,7 @@ class VoiceboxApp:
             pass
 
         self._build_shell()
+        self._build_page_menu()
         self._build_page_speak()
         self._build_page_settings()
         self._build_page_phrases()
@@ -1564,12 +1674,11 @@ class VoiceboxApp:
         threading.Thread(target=self._setup_virt, daemon=True).start()
         self.root.after(120, self._reload_hotkeys)
 
-        self.show_page("speak")
+        self.show_page("menu")
         self.root.protocol("WM_DELETE_WINDOW", self._exit)
-        self.root.bind("<FocusIn>", lambda e: self._keep_top())
         self.root.after(2000, self._topmost_pulse)
 
-    # ── shell / nav ─────────────────────────────────────────────────────
+    # ── shell ───────────────────────────────────────────────────────────
 
     def _build_shell(self) -> None:
         self.shell = tk.Frame(self.root, bg=BG)
@@ -1580,7 +1689,7 @@ class VoiceboxApp:
         self._nav = nav
 
         left = tk.Frame(nav, bg=BG2)
-        left.pack(side="left", padx=12, pady=10)
+        left.pack(side="left", padx=14, pady=12)
         self.lbl_brand = tk.Label(
             left, text="voicebox", fg=ACCENT, bg=BG2, font=("Segoe UI", 15, "bold"),
         )
@@ -1588,14 +1697,13 @@ class VoiceboxApp:
         self.lbl_mode = tk.Label(left, text="", fg=MUTED, bg=BG2, font=("Segoe UI", 9))
         self.lbl_mode.pack(side="left", padx=(12, 0))
 
+        # compact «Menu» chip when not on home
         right = tk.Frame(nav, bg=BG2)
         right.pack(side="right", padx=10, pady=8)
-        self.btn_nav_speak = ui_button(right, "Speak", lambda: self.show_page("speak"), padx=12, pady=6)
-        self.btn_nav_phrases = ui_button(right, "Phrases", lambda: self.show_page("phrases"), padx=12, pady=6)
-        self.btn_nav_settings = ui_button(right, "Settings", lambda: self.show_page("settings"), padx=12, pady=6)
-        self.btn_nav_speak.pack(side="left", padx=3)
-        self.btn_nav_phrases.pack(side="left", padx=3)
-        self.btn_nav_settings.pack(side="left", padx=3)
+        self.btn_nav_home = ui_button(
+            right, "Menu", lambda: self.show_page("menu"), padx=12, pady=6,
+        )
+        self.btn_nav_home.pack(side="left")
 
         self.content = tk.Frame(self.shell, bg=BG)
         self.content.pack(fill="both", expand=True)
@@ -1615,17 +1723,28 @@ class VoiceboxApp:
                 fr.pack(fill="both", expand=True)
             else:
                 fr.pack_forget()
-        # nav highlight
-        for btn, key in (
-            (self.btn_nav_speak, "speak"),
-            (self.btn_nav_phrases, "phrases"),
-            (self.btn_nav_settings, "settings"),
-        ):
-            if key == name:
-                btn.configure(bg=BTN_PRIMARY_BG, fg=BTN_PRIMARY_FG)
+        # Menu chip: hide on home, show elsewhere
+        try:
+            if name == "menu":
+                self.btn_nav_home.pack_forget()
             else:
-                btn.configure(bg=BTN_SECONDARY_BG, fg=FG)
+                self.btn_nav_home.pack(side="left")
+        except tk.TclError:
+            pass
         self._update_mode_label()
+        # window size: compact menu / roomy editors
+        try:
+            if name == "menu":
+                self.root.minsize(360, 400)
+                self.root.geometry("420x480")
+            elif name == "speak":
+                self.root.minsize(400, 280)
+                self.root.geometry("480x320")
+            else:
+                self.root.minsize(520, 420)
+                self.root.geometry("640x520")
+        except tk.TclError:
+            pass
         if name == "speak":
             try:
                 self.text.focus_set()
@@ -1706,10 +1825,26 @@ class VoiceboxApp:
         except tk.TclError:
             pass
 
-    def _on_hotkey_fire(self, name: str, text: str) -> None:
+    def _on_hotkey_fire(
+        self,
+        name: str,
+        text: str,
+        pool_n: int = 1,
+        next_chance: float | None = None,
+    ) -> None:
         def go() -> None:
             preview = text[:40] + ("…" if len(text) > 40 else "")
-            self._set_status(f"hotkey «{name}»: {preview}", ACCENT2)
+            extra = ""
+            if pool_n > 1:
+                pct = f" · next ~{int(round((next_chance or 0) * 100))}%" if next_chance is not None else ""
+                extra = f" · pool×{pool_n}{pct}"
+            self._set_status(f"hotkey «{name}»: {preview}{extra}", ACCENT2)
+            # weights may have changed on disk / in memory
+            try:
+                self.phrases = load_phrases()
+                _HOTKEYS._phrases = self.phrases
+            except Exception:
+                pass
 
         try:
             self.root.after(0, go)
@@ -1721,22 +1856,71 @@ class VoiceboxApp:
         color = OK if ok else (MUTED if "no hotkeys" in msg else ERR)
         self._set_status(f"hotkeys: {msg}", color)
 
-    # ── page: speak ─────────────────────────────────────────────────────
+    # ── page: home menu ─────────────────────────────────────────────────
+
+    def _build_page_menu(self) -> None:
+        page = tk.Frame(self.content, bg=BG)
+        self.pages["menu"] = page
+
+        center = tk.Frame(page, bg=BG)
+        center.pack(expand=True, fill="both", padx=28, pady=20)
+        self._menu_center = center
+
+        tk.Label(
+            center, text="voicebox", fg=ACCENT, bg=BG,
+            font=("Segoe UI", 22, "bold"),
+        ).pack(pady=(8, 4))
+        tk.Label(
+            center, text="Type → speak  ·  always on top",
+            fg=MUTED, bg=BG, font=("Segoe UI", 10),
+        ).pack(pady=(0, 28))
+
+        def menu_btn(text, command, *, primary=False, danger=False):
+            if primary:
+                bg, fg = BTN_PRIMARY_BG, BTN_PRIMARY_FG
+            elif danger:
+                bg, fg = BTN_DANGER_BG, FG
+            else:
+                bg, fg = BTN_SECONDARY_BG, FG
+            btn = tk.Button(
+                center, text=text, command=command,
+                bg=bg, fg=fg, activebackground=ACCENT, activeforeground=FG,
+                relief="flat", borderwidth=0, cursor="hand2",
+                font=("Segoe UI", 14, "bold"), pady=16,
+            )
+            btn.pack(fill="x", pady=7)
+            return btn
+
+        menu_btn("Speak", lambda: self.show_page("speak"), primary=True)
+        menu_btn("Phrases", lambda: self.show_page("phrases"))
+        menu_btn("Settings", lambda: self.show_page("settings"))
+        menu_btn("Exit", self._exit, danger=True)
+
+    # ── page: speak (type box) ──────────────────────────────────────────
 
     def _build_page_speak(self) -> None:
         page = tk.Frame(self.content, bg=BG)
         self.pages["speak"] = page
 
+        top = tk.Frame(page, bg=BG)
+        top.pack(fill="x", padx=14, pady=(10, 4))
+        tk.Label(
+            top, text="Speak", fg=ACCENT, bg=BG, font=("Segoe UI", 14, "bold"),
+        ).pack(side="left")
+        ui_button(top, "← Menu", lambda: self.show_page("menu"), padx=10, pady=4).pack(
+            side="right",
+        )
+
         hint = tk.Label(
             page,
-            text="Type text and press Enter  ·  /phrases  /settings  /exit  ·  or /your-command",
+            text="Enter = speak line  ·  or word+space  ·  /menu  /phrases  /settings  /exit",
             fg=MUTED, bg=BG, font=("Segoe UI", 9),
         )
-        hint.pack(anchor="w", padx=16, pady=(12, 4))
+        hint.pack(anchor="w", padx=14, pady=(0, 4))
         self._speak_hint = hint
 
         wrap = tk.Frame(page, bg=BORDER)
-        wrap.pack(fill="both", expand=True, padx=16, pady=8)
+        wrap.pack(fill="both", expand=True, padx=14, pady=(4, 10))
         inner = tk.Frame(wrap, bg=ENTRY_BG)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
 
@@ -1745,12 +1929,14 @@ class VoiceboxApp:
             bg=ENTRY_BG, fg=FG, insertbackground=ACCENT,
             selectbackground=BG3, selectforeground=FG,
             relief="flat", font=("Segoe UI", 13), wrap="word",
-            padx=14, pady=12, borderwidth=0, highlightthickness=0,
+            padx=12, pady=10, borderwidth=0, highlightthickness=0,
+            height=6,
         )
         self.text.pack(fill="both", expand=True)
         self.text.bind("<KeyRelease>", self._on_key)
         self.text.bind("<Return>", self._on_return)
         self.text.bind("<KP_Enter>", self._on_return)
+        self.text.bind("<Escape>", lambda e: (self.show_page("menu"), "break")[-1])
 
     # ── page: settings ──────────────────────────────────────────────────
 
@@ -1871,7 +2057,7 @@ class VoiceboxApp:
             relief="flat", borderwidth=0, cursor="hand2",
             font=("Segoe UI", 12, "bold"), pady=12,
         ).pack(fill="x", pady=(0, 8))
-        ui_button(fi, "← Back to Speak", lambda: self.show_page("speak")).pack(fill="x")
+        ui_button(fi, "← Menu", lambda: self.show_page("menu")).pack(fill="x")
 
         # Wheel scrolls the settings panel — not Mood/TTS Combobox values.
         # Bind after all children exist (incl. comboboxes).
@@ -1979,7 +2165,7 @@ class VoiceboxApp:
             f"Settings applied.\nMode: {mode}\nTheme: {theme}\nDefault TTS: {dtts}",
             parent=self.root,
         )
-        self.show_page("speak")
+        self.show_page("menu")
 
     def _recolor_shell(self) -> None:
         """Apply current theme colors to shell widgets."""
@@ -2121,7 +2307,7 @@ class VoiceboxApp:
 
         foot = tk.Frame(page, bg=BG)
         foot.grid(row=3, column=0, sticky="ew", padx=16, pady=8)
-        ui_button(foot, "← Back to Speak", lambda: self.show_page("speak"), primary=True).pack(
+        ui_button(foot, "← Menu", lambda: self.show_page("menu"), primary=True).pack(
             side="right",
         )
         self._ph_editor_visible = False
@@ -2202,12 +2388,27 @@ class VoiceboxApp:
         text = read_phrase_text(p).replace("\n", " ").strip()
         if len(text) > 80:
             text = text[:77] + "…"
+        pool_bits = []
+        hk = p.get("hotkey") or ""
+        if hk:
+            hpool = find_phrases_by_hotkey(hk, self.phrases)
+            if len(hpool) > 1:
+                pct = int(round(phrase_pick_chance(p, hpool) * 100))
+                pool_bits.append(f"hotkey pool×{len(hpool)} · next ~{pct}%")
+        cmd = p.get("command") or ""
+        if cmd:
+            cpool = find_phrases_by_command(cmd, self.phrases)
+            if len(cpool) > 1:
+                pct = int(round(phrase_pick_chance(p, cpool) * 100))
+                pool_bits.append(f"cmd pool×{len(cpool)} · next ~{pct}%")
+        pool_line = ("\n🎲 " + "  ·  ".join(pool_bits)) if pool_bits else ""
         self.ph_info.configure(
             text=(
                 f"Name: {p.get('name') or '—'}   ·   "
                 f"Hotkey: {hotkey_display(p.get('hotkey') or '')}   ·   "
                 f"Cmd: {p.get('command') or '—'}   ·   "
-                f"TTS: {p.get('tts_provider') or 'auto'}\n"
+                f"TTS: {p.get('tts_provider') or 'auto'}"
+                f"{pool_line}\n"
                 f"Text: {text or '(empty)'}"
             ),
             fg=FG,
@@ -2275,18 +2476,10 @@ class VoiceboxApp:
             if cmd_raw and not command:
                 messagebox.showerror("Error", "Invalid command (use /name)", parent=self.root)
                 return
-            if command:
-                if command in RESERVED_COMMANDS:
-                    messagebox.showerror("Error", f"{command} is reserved", parent=self.root)
-                    return
-                for other in self.phrases:
-                    if self._edit_phrase_id and other["id"] == self._edit_phrase_id:
-                        continue
-                    if normalize_slash_command(other.get("command") or "") == command:
-                        messagebox.showerror(
-                            "Error", f"Command used by «{other.get('name')}»", parent=self.root,
-                        )
-                        return
+            if command and command in RESERVED_COMMANDS:
+                messagebox.showerror("Error", f"{command} is reserved", parent=self.root)
+                return
+            # Same command on several phrases is allowed → weighted random pool
 
             if self._edit_phrase_id:
                 p = next((x for x in self.phrases if x["id"] == self._edit_phrase_id), None)
@@ -2301,7 +2494,7 @@ class VoiceboxApp:
                 pid = uuid.uuid4().hex[:12]
                 p = {
                     "id": pid, "name": name, "hotkey": "", "command": command,
-                    "tts_provider": "auto", "file": f"{pid}.txt",
+                    "tts_provider": "auto", "file": f"{pid}.txt", "weight": 1.0,
                 }
                 write_phrase_text(p, text)
                 self.phrases.append(p)
@@ -2334,7 +2527,8 @@ class VoiceboxApp:
             self._capture_tokens = [x for x in cur.split("+") if x]
         self.hk_lbl.configure(text=hotkey_display(normalize_hotkey_tokens(self._capture_tokens)))
         self.hk_hint.configure(
-            text="Press 1–3 keys (incl. numpad). Then Save.  Esc = back."
+            text="Press 1–3 keys (incl. numpad). Then Save.  Esc = back.\n"
+                 "Same combo on several phrases = weighted random pool.",
         )
         self.show_page("hotkey")
 
@@ -2345,7 +2539,8 @@ class VoiceboxApp:
             return
         raw = simpledialog.askstring(
             "Command",
-            "Slash command (e.g. /terz). Empty = clear.",
+            "Slash command (e.g. /hello). Empty = clear.\n"
+            "Same command on several phrases = weighted random pool.",
             initialvalue=p.get("command") or "",
             parent=self.root,
         )
@@ -2360,14 +2555,16 @@ class VoiceboxApp:
         if not cmd or cmd in RESERVED_COMMANDS:
             messagebox.showerror("Error", "Invalid or reserved command", parent=self.root)
             return
-        for other in self.phrases:
-            if other["id"] != p["id"] and normalize_slash_command(other.get("command") or "") == cmd:
-                messagebox.showerror("Error", "Command already used", parent=self.root)
-                return
         p["command"] = cmd
         save_phrases(self.phrases)
         self._phrases_refresh()
-        self._set_status(f"command {cmd} set", OK)
+        pool = find_phrases_by_command(cmd, self.phrases)
+        if len(pool) > 1:
+            self._set_status(
+                f"command {cmd} set · shared pool×{len(pool)} (weighted random)", OK,
+            )
+        else:
+            self._set_status(f"command {cmd} set", OK)
 
     def _ph_tts(self) -> None:
         p = self._ph_selected()
@@ -2541,24 +2738,25 @@ class VoiceboxApp:
             self.show_page("phrases")
             return
         hk = normalize_hotkey_tokens(hk.split("+")) if hk else ""
-        if hk:
-            for other in self.phrases:
-                if other["id"] != pid and normalize_hotkey_tokens(
-                    (other.get("hotkey") or "").split("+")
-                ) == hk:
-                    messagebox.showerror(
-                        "Hotkey", "Already used by another phrase", parent=self.root,
-                    )
-                    return
+        # Same hotkey on several phrases is allowed → weighted random pool
         p["hotkey"] = hk
         save_phrases(self.phrases)
         self._reload_hotkeys()
         self._hotkey_target = None
         self._capture_tokens = []
         self.show_page("phrases")
-        self._set_status(
-            f"hotkey {hotkey_display(hk) if hk else '(cleared)'} saved", OK,
-        )
+        if hk:
+            pool = find_phrases_by_hotkey(hk, self.phrases)
+            if len(pool) > 1:
+                self._set_status(
+                    f"hotkey {hotkey_display(hk)} saved · shared pool×{len(pool)} "
+                    f"(weighted random)",
+                    OK,
+                )
+            else:
+                self._set_status(f"hotkey {hotkey_display(hk)} saved", OK)
+        else:
+            self._set_status("hotkey (cleared) saved", OK)
 
     # ── speak input handlers ────────────────────────────────────────────
 
@@ -2568,6 +2766,11 @@ class VoiceboxApp:
 
         if stripped in ("/exit", "/quit"):
             self._exit()
+            return "break"
+        if stripped in ("/menu", "/home"):
+            self.text.delete("1.0", "end")
+            self._spoken_upto = 0
+            self.show_page("menu")
             return "break"
         if stripped in ("/settings", "/set"):
             self.text.delete("1.0", "end")
@@ -2600,24 +2803,33 @@ class VoiceboxApp:
 
     def _try_phrase_command(self, stripped: str) -> bool:
         token = stripped.split()[0]
-        phrase = find_phrase_by_command(token, self.phrases)
-        if not phrase:
-            # reload from disk in case external change
+        pool = find_phrases_by_command(token, self.phrases)
+        if not pool:
             self.phrases = load_phrases()
-            phrase = find_phrase_by_command(token, self.phrases)
-        if not phrase:
+            pool = find_phrases_by_command(token, self.phrases)
+        if not pool:
             return False
+        # drop empty bodies
+        pool = [p for p in pool if read_phrase_text(p).strip()]
+        if not pool:
+            self.text.delete("1.0", "end")
+            self._spoken_upto = 0
+            self._set_status(f"{token}: empty phrase", ERR)
+            return True
+        pool_n = len(pool)
+        phrase = pick_weighted_phrase(pool, self.phrases, persist=True)
         text = read_phrase_text(phrase).strip()
         self.text.delete("1.0", "end")
         self._spoken_upto = 0
-        if not text:
-            self._set_status(f"{token}: empty phrase", ERR)
-            return True
         name = phrase.get("name") or token
         prov = phrase.get("tts_provider") or "auto"
         n = _TTS.submit(text, self.cfg, provider=prov, phrase_id=phrase.get("id"))
+        extra = ""
+        if pool_n > 1:
+            pct = int(round(phrase_pick_chance(phrase, pool) * 100))
+            extra = f" · pool×{pool_n} · next ~{pct}%"
         self._set_status(
-            f"cmd {token} → «{name}» ({prov})" + (f" · q={n}" if n > 1 else ""),
+            f"cmd {token} → «{name}» ({prov}){extra}" + (f" · q={n}" if n > 1 else ""),
             ACCENT2,
         )
         return True
@@ -2629,6 +2841,11 @@ class VoiceboxApp:
         stripped = content.strip()
         if stripped in ("/exit", "/quit"):
             self._exit()
+            return
+        if stripped in ("/menu", "/home"):
+            self.text.delete("1.0", "end")
+            self._spoken_upto = 0
+            self.show_page("menu")
             return
         if stripped in ("/settings", "/set"):
             self.text.delete("1.0", "end")
@@ -2684,12 +2901,13 @@ class VoiceboxApp:
             pass
 
     def run(self) -> None:
-        # focus hotkey page bindings when shown
         def on_show(e=None):
             if self._page == "hotkey":
-                self.pages["hotkey"].focus_set()
-        self.root.bind("<Map>", on_show)
-        self.text.focus_set()
+                try:
+                    self.pages["hotkey"].focus_set()
+                except tk.TclError:
+                    pass
+        self.root.bind("<Map>", on_show, add="+")
         self.root.mainloop()
 
 

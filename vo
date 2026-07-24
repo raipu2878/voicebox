@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Short launcher: open the voicebox window
+# Launch voicebox as a standalone app (detached from the terminal by default).
+#   vo                 → open window, free the shell immediately
+#   VOICEBOX_FOREGROUND=1 vo   → keep attached (for debugging)
 set -euo pipefail
-# if vo is a symlink, resolve to the real script path
+
 SOURCE="${BASH_SOURCE[0]}"
 while [[ -L "$SOURCE" ]]; do
   DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
@@ -9,4 +11,24 @@ while [[ -L "$SOURCE" ]]; do
   [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 ROOT="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-exec "$ROOT/.venv/bin/python" "$ROOT/voicebox.py" "$@"
+PY="$ROOT/.venv/bin/python"
+APP="$ROOT/voicebox.py"
+
+if [[ ! -x "$PY" ]]; then
+  echo "voicebox: venv missing. Run: $ROOT/setup.sh" >&2
+  exit 1
+fi
+
+# Detach so closing/killing the terminal does not kill the GUI.
+if [[ "${VOICEBOX_FOREGROUND:-0}" != "1" ]]; then
+  # setsid: new session; nohup: ignore SIGHUP; redirect stdio
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "$PY" "$APP" "$@" >/dev/null 2>&1
+  else
+    nohup "$PY" "$APP" "$@" >/dev/null 2>&1 &
+    disown %% 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+exec "$PY" "$APP" "$@"

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=voicebox
+GenericName=TTS Voice Box
+Comment=Always-on-top text-to-speech for Linux
+Exec=vo
+TryExec=vo
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Utility;Accessibility;
+Keywords=voice;tts;speech;speak;voicebox;elevenlabs;
+StartupNotify=true
+StartupWMClass=voicebox
