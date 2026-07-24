@@ -1,0 +1,28 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Secrets & local config (keys live under ~/.config/voicebox/)
+.env
+.env.*
+*.pem
+config.local.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs / temp audio
+*.log
+*.mp3
+*.wav
+/tmp/
